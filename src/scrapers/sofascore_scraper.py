@@ -39,22 +39,76 @@ class SofaScoreScraper:
         from a league season page. Adjust selectors for current SofaScore HTML.
         Returns a list of dicts: {match_url, home, away, match_date}
         """
+        # SofaScore exposes JSON data embedded in the page; try a league API endpoint first
         url = f"https://www.sofascore.com/tournament/football/{league_slug}/{season}"
         html = self._get(url)
         if not html:
             return []
         soup = BeautifulSoup(html, "lxml")
         matches = []
-        # NOTE: selectors are approximate and may need tuning
-        for a in soup.select("a[href*='/match/']")[:500]:
+        # Try to find links to matches using anchor tags, fallback to embedded JSON
+        for a in soup.select("a[href*='/match/']"):
             href = a.get("href")
             if not href:
                 continue
+            if "/match/" not in href:
+                continue
             match_url = "https://www.sofascore.com" + href
-            text = a.get_text(strip=True)
-            # best-effort parse
-            matches.append({"match_url": match_url, "title": text})
-        return matches
+            title = a.get_text(strip=True)
+            matches.append({"match_url": match_url, "title": title})
+
+        # If not many matches found, attempt to parse embedded JSON state for fixtures
+        if len(matches) < 30:
+            for script in soup.find_all("script"):
+                if script.string and "window.__INITIAL_STATE__" in script.string:
+                    try:
+                        txt = script.string
+                        idx = txt.find("window.__INITIAL_STATE__ = ")
+                        if idx != -1:
+                            jtext = txt[idx + len("window.__INITIAL_STATE__ = "):]
+                            jtext = jtext.strip().rstrip(";")
+                            data = json.loads(jtext)
+                            # navigate common paths where fixtures might exist
+                            # Best-effort: look for "fixtures" or "events" keys
+                            def walk_dict(d):
+                                if isinstance(d, dict):
+                                    for k, v in d.items():
+                                        if k and "fixture" in k.lower() or "match" in k.lower():
+                                            return v
+                                    for v in d.values():
+                                        r = walk_dict(v)
+                                        if r:
+                                            return r
+                                elif isinstance(d, list):
+                                    for item in d:
+                                        r = walk_dict(item)
+                                        if r:
+                                            return r
+                                return None
+
+                            fixtures = walk_dict(data)
+                            if fixtures and isinstance(fixtures, list):
+                                for item in fixtures[:500]:
+                                    try:
+                                        if isinstance(item, dict) and item.get("id"):
+                                            murl = f"https://www.sofascore.com/match/{item.get('id')}"
+                                            matches.append({"match_url": murl, "title": item.get("name")})
+                                    except Exception:
+                                        continue
+                            break
+                    except Exception:
+                        continue
+
+        # Deduplicate by URL
+        seen = set()
+        dedup = []
+        for m in matches:
+            u = m.get("match_url")
+            if not u or u in seen:
+                continue
+            seen.add(u)
+            dedup.append(m)
+        return dedup
 
     def fetch_match_events(self, match_url: str) -> Dict:
         """Fetch structured match event data from a match page.
