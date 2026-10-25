@@ -10,6 +10,7 @@ import json
 import time
 import logging
 from pathlib import Path
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
 
 LOG = logging.getLogger("odds_collector")
 
@@ -21,12 +22,22 @@ class OddsCollector:
         self.session.headers.update({"User-Agent": ua})
         self.rate_limit_sec = rate_limit_sec
 
+    @retry(
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception_type(requests.exceptions.RequestException),
+        reraise=True,
+        before_sleep=before_sleep_log(LOG, logging.WARNING),
+    )
     def _get(self, url: str):
         try:
             r = self.session.get(url, timeout=15)
             r.raise_for_status()
             time.sleep(self.rate_limit_sec)
             return r.text
+        except requests.exceptions.RequestException:
+            LOG.warning("Transient odds request error for %s; will retry if attempts remain", url)
+            raise
         except Exception:
             LOG.exception("Odds GET failed: %s", url)
             return None

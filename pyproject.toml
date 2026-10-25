@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "sports-predictions"
+version = "0.1.0"
+description = "Sports predictions data pipeline"
+dependencies = [
+	"fastapi",
+	"uvicorn",
+	"httpx",
+	"python-dotenv",
+	"sqlalchemy",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["src*"]
+namespaces = true

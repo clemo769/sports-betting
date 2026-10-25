@@ -11,6 +11,8 @@ import json
 import logging
 from pathlib import Path
 from typing import List, Dict, Optional
+from tenacity import retry, stop_after_attempt, wait_exponential, retry_if_exception_type, before_sleep_log
+from src.normalization.team_aliases import to_canonical
 
 LOG = logging.getLogger("sofascore_scraper")
 
@@ -22,13 +24,24 @@ class SofaScoreScraper:
         self.session.headers.update({"User-Agent": ua})
         self.rate_limit_sec = rate_limit_sec
 
+    @retry(
+        stop=stop_after_attempt(4),
+        wait=wait_exponential(multiplier=1, min=2, max=30),
+        retry=retry_if_exception_type(requests.exceptions.RequestException),
+        reraise=True,
+        before_sleep=before_sleep_log(LOG, logging.WARNING),
+    )
     def _get(self, url: str) -> Optional[str]:
         try:
             resp = self.session.get(url, timeout=15)
             resp.raise_for_status()
             time.sleep(self.rate_limit_sec)
             return resp.text
-        except Exception as e:
+        except requests.exceptions.RequestException:
+            LOG.warning("Transient request error for %s; will retry if attempts remain", url)
+            # Re-raise to trigger tenacity retry
+            raise
+        except Exception:
             LOG.exception("GET failed: %s", url)
             return None
 
@@ -55,7 +68,23 @@ class SofaScoreScraper:
                 continue
             match_url = "https://www.sofascore.com" + href
             title = a.get_text(strip=True)
-            matches.append({"match_url": match_url, "title": title})
+            # Attempt to split title into home/away and canonicalize names
+            home_team = None
+            away_team = None
+            if title:
+                for sep in [" - ", " – ", " — ", " vs ", " vs. ", " v ", " v. "]:
+                    if sep in title:
+                        parts = [p.strip() for p in title.split(sep, 1)]
+                        if len(parts) == 2:
+                            home_team = to_canonical(parts[0])
+                            away_team = to_canonical(parts[1])
+                        break
+            entry = {"match_url": match_url, "title": title}
+            if home_team:
+                entry["home_team"] = home_team
+            if away_team:
+                entry["away_team"] = away_team
+            matches.append(entry)
 
         # If not many matches found, attempt to parse embedded JSON state for fixtures
         if len(matches) < 30:
@@ -73,7 +102,7 @@ class SofaScoreScraper:
                             def walk_dict(d):
                                 if isinstance(d, dict):
                                     for k, v in d.items():
-                                        if k and "fixture" in k.lower() or "match" in k.lower():
+                                        if k and ("fixture" in k.lower() or "match" in k.lower()):
                                             return v
                                     for v in d.values():
                                         r = walk_dict(v)
@@ -92,7 +121,37 @@ class SofaScoreScraper:
                                     try:
                                         if isinstance(item, dict) and item.get("id"):
                                             murl = f"https://www.sofascore.com/match/{item.get('id')}"
-                                            matches.append({"match_url": murl, "title": item.get("name")})
+                                            title = item.get("name")
+                                            # Try to extract explicit home/away from known keys
+                                            home = item.get("home") or item.get("homeTeam") or item.get("homeName") or item.get("home_name")
+                                            away = item.get("away") or item.get("awayTeam") or item.get("awayName") or item.get("away_name")
+                                            if home or away:
+                                                home_c = to_canonical(home) if home else None
+                                                away_c = to_canonical(away) if away else None
+                                                entry = {"match_url": murl, "title": title}
+                                                if home_c:
+                                                    entry["home_team"] = home_c
+                                                if away_c:
+                                                    entry["away_team"] = away_c
+                                                matches.append(entry)
+                                            else:
+                                                # Fallback: try splitting the title
+                                                home_team = None
+                                                away_team = None
+                                                if title:
+                                                    for sep in [" - ", " – ", " — ", " vs ", " vs. ", " v ", " v. "]:
+                                                        if sep in title:
+                                                            parts = [p.strip() for p in title.split(sep, 1)]
+                                                            if len(parts) == 2:
+                                                                home_team = to_canonical(parts[0])
+                                                                away_team = to_canonical(parts[1])
+                                                            break
+                                                entry = {"match_url": murl, "title": title}
+                                                if home_team:
+                                                    entry["home_team"] = home_team
+                                                if away_team:
+                                                    entry["away_team"] = away_team
+                                                matches.append(entry)
                                     except Exception:
                                         continue
                             break

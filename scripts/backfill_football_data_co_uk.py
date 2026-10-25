@@ -9,6 +9,7 @@ under `data/raw/football-data-co-uk/`.
 import argparse
 import logging
 from pathlib import Path
+from src.etl.season_utils import sofascore_season_to_fdco
 import requests
 
 LOG = logging.getLogger("fdco_backfill")
@@ -53,6 +54,9 @@ def main():
 
     league = args.league
     season = args.season
+    # Accept a 4-digit SofaScore-style year and convert it to fdco '2223' format
+    if len(season) == 4 and season.isdigit():
+        season = sofascore_season_to_fdco(season)
     if league not in LEAGUE_MAP:
         LOG.error("Unknown league %s. Supported: %s", league, list(LEAGUE_MAP.keys()))
         return

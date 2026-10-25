@@ -48,7 +48,9 @@ def parse_oddsportal_match(html: str) -> List[Dict]:
                     m = re.search(r"\d+\.?\d*", price)
                     if m:
                         price_val = float(m.group(0))
-                results.append({"bookie": bookie, "selection": sel, "price": price_val})
+                # Validate price: only keep plausible numeric odds
+                if price_val is not None and (price_val > 1.0 and price_val < 1000):
+                    results.append({"bookie": bookie, "selection": sel, "price": price_val})
             except Exception:
                 continue
     return results
