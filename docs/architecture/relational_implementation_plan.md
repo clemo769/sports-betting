@@ -4,7 +4,7 @@
 
 This document records the approved relational design and its implementation status. Alembic migrations, ORM models, repositories, the read API, and opt-in persistence entry points are implemented; routine pipeline integration and evaluation persistence remain pending.
 
-The target database is PostgreSQL. The regular pipeline remains file-based by default. Local PostgreSQL 18.6 is reachable on port 5432 using the project role's password-authenticated connection. Migrations 001 through 005 are applied to the local `sports_predictions_dev` database; all six domain tables exist. SQLAlchemy mappings and repositories mirror the migrated schema, and Alembic reports no schema drift. The read-only FastAPI routes expose health, match, prediction, and model records. Opt-in CLIs persist verified linked records and register trained model versions; a separate prediction CLI requires a registered XGBoost model and an exact per-match manifest whose referenced source records have known availability at or before each cutoff. These write paths use caller-owned database transactions. No historical rows have been backfilled because current source availability is unresolved. Evaluation persistence and routine pipeline integration remain unimplemented. Docker Compose targets PostgreSQL 16 but was not used for the active local server.
+The target database is PostgreSQL. The regular pipeline remains file-based by default. Local PostgreSQL 18.6 is reachable on port 5432 using the project role's password-authenticated connection. Migrations 001 through 005 are applied to the local `sports_predictions_dev` database; all six domain tables exist. SQLAlchemy mappings and repositories mirror the migrated schema, and Alembic reports no schema drift. The read-only FastAPI routes expose health, match, prediction, and model records. Opt-in CLIs persist verified linked records and register trained model versions; a separate prediction CLI requires a registered XGBoost model and an exact per-match manifest whose referenced source records have known availability at or before each cutoff. Source revisions and result-observation corrections are append-only at the application boundary. These write paths use caller-owned database transactions. No historical rows have been backfilled because current source availability is unresolved. Evaluation persistence and routine pipeline integration remain unimplemented. Docker Compose targets PostgreSQL 16 but was not used for the active local server.
 
 ## Final Decisions
 
@@ -358,16 +358,16 @@ That hardening migration must include an operational recovery procedure and test
 
 ## Implementation Acceptance Checklist
 
-- [ ] Confirm PostgreSQL version and migration tool.
-- [ ] Confirm UUID generation policy.
-- [ ] Confirm canonical team/competition status vocabularies.
+- [x] Confirm PostgreSQL version and migration tool: local PostgreSQL 18.6 and Alembic.
+- [x] Confirm UUID generation policy: application-generated UUIDs.
+- [ ] Finalize canonical team/competition vocabularies; lifecycle status vocabularies are defined, but no global canonical team/competition registry exists.
 - [ ] Confirm whether all persisted source timestamps can be normalized to `timestamptz` without inventing timezone information.
-- [ ] Define the source snapshot/run identifier format used in `source_data_reference`.
-- [ ] Define feature, schema, and model version naming conventions.
-- [ ] Define training-run identifier ownership before inserting MODEL rows.
-- [ ] Define application validation tests for cross-table temporal rules.
+- [ ] Define a source snapshot/run identifier format beyond the current non-empty string requirement.
+- [ ] Define feature, schema, and model version naming conventions beyond caller-supplied non-empty values.
+- [x] Define training-run identifier ownership: model registration generates one UUID per training execution.
+- [x] Define application validation tests for cross-table temporal rules, feature/model compatibility, and same-match provenance.
 - [ ] Approve the later immutability hardening approach before real prediction persistence.
-- [ ] Produce a rollback and backup plan before any migration is executed.
+- [ ] Produce a production rollback and backup plan before production migrations or system-of-record use.
 
 ## Explicitly Not Implemented
 
@@ -377,6 +377,6 @@ The current implementation does not include:
 - triggers;
 - source snapshot or join tables;
 - team/alias tables;
-- training-run or evaluation-run tables.
+- training-run or evaluation-run tables;
 - evaluation-result persistence or endpoints;
 - automatic persistence as part of the default file-based pipeline.
