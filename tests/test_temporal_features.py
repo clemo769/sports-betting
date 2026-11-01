@@ -1,10 +1,12 @@
 from datetime import datetime, timezone
+from uuid import uuid4
 
 import pandas as pd
 import pytest
 
 from src.features.feature_builder import build_features, compute_elo_series, compute_form_series
 from src.features.temporal_contract import is_available, validate_prediction_cutoff
+from src.models import train_baseline
 from src.models.train_baseline import prepare_training_data
 
 
@@ -82,6 +84,56 @@ def test_training_labels_stay_with_feature_match_after_sorting(tmp_path):
         {"match_id": "early", "home_elo": 1, "label_value": 1},
         {"match_id": "late", "home_elo": 2, "label_value": 0},
     ]
+
+
+def test_model_registration_uses_explicit_schema_metadata_and_transaction(monkeypatch, tmp_path):
+    captured = {}
+
+    class SessionContext:
+        def __enter__(self):
+            return "session"
+
+        def __exit__(self, exc_type, exc_value, traceback):
+            return False
+
+    monkeypatch.setattr(train_baseline, "session_scope", lambda database_url: SessionContext())
+    monkeypatch.setattr(
+        train_baseline,
+        "persist_model_version",
+        lambda session, **kwargs: captured.update(session=session, **kwargs),
+    )
+    features_path = tmp_path / "features.parquet"
+    labels_path = tmp_path / "labels.csv"
+    artifact_path = tmp_path / "model.json"
+    model_id, training_run_id = uuid4(), uuid4()
+
+    train_baseline.register_model_version(
+        "postgresql://test",
+        model_id=model_id,
+        model_version="v1.2.0",
+        feature_version="features-v1",
+        training_run_id=training_run_id,
+        features_path=features_path,
+        labels_path=labels_path,
+        artifact_path=artifact_path,
+        configuration_reference={"objective": "binary:logistic"},
+    )
+
+    assert captured == {
+        "session": "session",
+        "model_id": model_id,
+        "model_version": "v1.2.0",
+        "model_type": "xgboost",
+        "feature_version": "features-v1",
+        "training_run_id": training_run_id,
+        "training_data_reference": {
+            "features_path": str(features_path.resolve()),
+            "labels_path": str(labels_path.resolve()),
+        },
+        "artifact_reference": str(artifact_path.resolve()),
+        "configuration_reference": {"objective": "binary:logistic"},
+        "evaluation_status": "unevaluated",
+    }
 
 
 def test_prediction_cutoff_requires_known_availability():

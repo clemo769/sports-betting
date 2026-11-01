@@ -7,7 +7,11 @@ import pandas as pd
 import xgboost as xgb
 from pathlib import Path
 import logging
+from uuid import UUID, uuid4
 from sklearn.metrics import log_loss, brier_score_loss, roc_auc_score
+
+from src.db.ingestion import persist_model_version
+from src.db.session import session_scope
 
 
 def prepare_training_data(features_path: Path, labels_path: Path):
@@ -19,7 +23,50 @@ def prepare_training_data(features_path: Path, labels_path: Path):
     return df.sort_values(["match_date_utc", "match_id"], kind="mergesort").reset_index(drop=True)
 
 
-def train(features_path: Path, labels_path: Path, out_dir: Path):
+def register_model_version(
+    database_url: str | None,
+    *,
+    model_id: UUID,
+    model_version: str,
+    feature_version: str,
+    training_run_id: UUID,
+    features_path: Path,
+    labels_path: Path,
+    artifact_path: Path,
+    configuration_reference: dict,
+):
+    with session_scope(database_url) as session:
+        return persist_model_version(
+            session,
+            model_id=model_id,
+            model_version=model_version,
+            model_type="xgboost",
+            feature_version=feature_version,
+            training_run_id=training_run_id,
+            training_data_reference={
+                "features_path": str(features_path.resolve()),
+                "labels_path": str(labels_path.resolve()),
+            },
+            artifact_reference=str(artifact_path.resolve()),
+            configuration_reference=configuration_reference,
+            evaluation_status="unevaluated",
+        )
+
+
+def train(
+    features_path: Path,
+    labels_path: Path,
+    out_dir: Path,
+    *,
+    register_model: bool = False,
+    database_url: str | None = None,
+    model_id: UUID | None = None,
+    model_version: str | None = None,
+    feature_version: str | None = None,
+):
+    if register_model and (model_id is None or not model_version or not feature_version):
+        raise ValueError("model registration requires model_id, model_version, and feature_version")
+
     df = prepare_training_data(features_path, labels_path)
     # Simple features
     X = df[["match_id", "match_date_utc", "home_elo", "away_elo", "home_form_last3", "away_form_last3"]].copy()
@@ -47,7 +94,9 @@ def train(features_path: Path, labels_path: Path, out_dir: Path):
 
     bst = xgb.train(params, dtrain, num_boost_round=100, evals=[(dtest, "test")], early_stopping_rounds=10)
 
-    preds = bst.predict(dtest)
+    best_iteration = getattr(bst, "best_iteration", None)
+    iteration_range = (0, best_iteration + 1) if best_iteration is not None else (0, 0)
+    preds = bst.predict(dtest, iteration_range=iteration_range)
     ll = log_loss(y_test, preds)
     bs = brier_score_loss(y_test, preds)
     try:
@@ -171,6 +220,25 @@ def train(features_path: Path, labels_path: Path, out_dir: Path):
         f.write(f"book_log_loss: {ll_book}\n")
         f.write(f"book_roc_auc: {auc_book}\n")
 
+    if register_model:
+        register_model_version(
+            database_url,
+            model_id=model_id,
+            model_version=model_version,
+            feature_version=feature_version,
+            training_run_id=uuid4(),
+            features_path=features_path,
+            labels_path=labels_path,
+            artifact_path=model_path,
+            configuration_reference={
+                **params,
+                "num_boost_round": 100,
+                "early_stopping_rounds": 10,
+                "best_iteration": int(best_iteration) if best_iteration is not None else None,
+                "missing_value_strategy": "replace with zero",
+            },
+        )
+
     logging.info("Trained model saved to %s; metrics saved to %s", model_path, metrics_path)
 
 
@@ -181,5 +249,26 @@ if __name__ == "__main__":
     p.add_argument("--features", default="data/processed/features_batch.parquet")
     p.add_argument("--labels", default="data/processed/labels.csv")
     p.add_argument("--out", default="models")
+    p.add_argument("--register-model", action="store_true")
+    p.add_argument("--database-url", default=None)
+    p.add_argument("--model-id", type=UUID, default=None)
+    p.add_argument("--model-version", default=None)
+    p.add_argument("--feature-version", default=None)
     args = p.parse_args()
-    train(Path(args.features), Path(args.labels), Path(args.out))
+    if not args.register_model and any(
+        value is not None for value in (args.database_url, args.model_id, args.model_version, args.feature_version)
+    ):
+        p.error("--database-url and model metadata require --register-model")
+    try:
+        train(
+            Path(args.features),
+            Path(args.labels),
+            Path(args.out),
+            register_model=args.register_model,
+            database_url=args.database_url,
+            model_id=args.model_id,
+            model_version=args.model_version,
+            feature_version=args.feature_version,
+        )
+    except ValueError as error:
+        p.error(str(error))

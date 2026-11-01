@@ -2,9 +2,9 @@
 
 ## Status and Scope
 
-This document records the approved relational design and its implementation status. Alembic migrations create database tables; ORM models and application integration are still pending.
+This document records the approved relational design and its implementation status. Alembic migrations, ORM models, repositories, the read API, and opt-in persistence entry points are implemented; routine pipeline integration and evaluation persistence remain pending.
 
-The target database is PostgreSQL. The pipeline remains file-based by default. Local PostgreSQL 18.6 is reachable on port 5432 using the project role's password-authenticated connection. Migrations 001 through 005 are applied to the local `sports_predictions_dev` database; all six domain tables exist. SQLAlchemy mappings and repositories mirror the migrated schema, and Alembic reports no schema drift. A guarded ingestion CLI writes matched fixtures, source provenance, and result observations only when given a separate verified timezone-aware event-time mapping. Its PostgreSQL transaction path was exercised and rolled back; current source dates are unresolved, so no historical rows have been backfilled. Backend API integration remains unimplemented. Docker Compose targets PostgreSQL 16 but was not used for the active local server.
+The target database is PostgreSQL. The regular pipeline remains file-based by default. Local PostgreSQL 18.6 is reachable on port 5432 using the project role's password-authenticated connection. Migrations 001 through 005 are applied to the local `sports_predictions_dev` database; all six domain tables exist. SQLAlchemy mappings and repositories mirror the migrated schema, and Alembic reports no schema drift. The read-only FastAPI routes expose health, match, prediction, and model records. Opt-in CLIs persist verified linked records and register trained model versions; a separate prediction CLI requires a registered XGBoost model and an exact per-match manifest whose referenced source records have known availability at or before each cutoff. These write paths use caller-owned database transactions. No historical rows have been backfilled because current source availability is unresolved. Evaluation persistence and routine pipeline integration remain unimplemented. Docker Compose targets PostgreSQL 16 but was not used for the active local server.
 
 ## Final Decisions
 
@@ -371,15 +371,12 @@ That hardening migration must include an operational recovery procedure and test
 
 ## Explicitly Not Implemented
 
-This plan does not create:
+The current implementation does not include:
 
-- database tables;
-- migration files;
 - database users or permissions;
 - triggers;
-- ORM models;
-- backend services;
-- API routes;
 - source snapshot or join tables;
 - team/alias tables;
 - training-run or evaluation-run tables.
+- evaluation-result persistence or endpoints;
+- automatic persistence as part of the default file-based pipeline.

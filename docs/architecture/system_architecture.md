@@ -135,7 +135,7 @@ The repository currently implements the source-to-model portion as scripts and P
 - Outputs: persistent domain records.
 - Dependencies: future database choice and migrations.
 - Must not: become an undocumented second source of truth for feature logic.
-- Status: relational schema implemented locally through Alembic Migrations 001-005 (`match`, `source_record`, `feature_set`, `model`, `prediction`, `result_observation`), with matching SQLAlchemy mappings, repositories, and a guarded linked-record persistence CLI. The regular pipeline still persists to CSV, parquet, JSON, and text; historical database backfill is gated on verified timezone-aware event times.
+- Status: relational schema implemented locally through Alembic Migrations 001-005 (`match`, `source_record`, `feature_set`, `model`, `prediction`, `result_observation`), with matching SQLAlchemy mappings, repositories, a guarded linked-record persistence CLI, opt-in model registration, and manifest-gated prediction persistence. The regular pipeline still persists to CSV, parquet, JSON, and text; historical database backfill and prediction writes remain gated on explicit, verified source availability and timezone-aware cutoffs.
 
 ### Backend Services
 

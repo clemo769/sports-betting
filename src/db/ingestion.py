@@ -8,7 +8,14 @@ from uuid import NAMESPACE_URL, UUID, uuid5
 
 from sqlalchemy.orm import Session
 
-from src.db.models import Match, ResultObservation, SourceRecord
+from src.db.models import (
+    FeatureSet,
+    Match,
+    ModelVersion,
+    Prediction,
+    ResultObservation,
+    SourceRecord,
+)
 from src.db.repositories import MatchRepository, SourceRecordRepository
 
 
@@ -44,6 +51,295 @@ def _goal_value(value: Any) -> int | None:
     if goals < 0 or goals != value:
         raise ValueError(f"goal value must be a non-negative integer, got {value!r}")
     return goals
+
+
+def _require_nonempty(value: Any, field_name: str) -> str:
+    if value is None or str(value).strip() == "":
+        raise ValueError(f"{field_name} must be a non-empty string")
+    return str(value)
+
+
+def _require_mapping(value: Any, field_name: str) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        raise ValueError(f"{field_name} must be a dictionary")
+    return value
+
+
+def persist_feature_set(
+    session: Session,
+    *,
+    feature_set_id: UUID,
+    match_id: UUID,
+    prediction_cutoff: datetime,
+    feature_version: str,
+    feature_generation_version: str,
+    source_data_reference: dict[str, Any],
+    schema_version: str,
+    feature_payload: dict[str, Any],
+) -> FeatureSet:
+    """Persist one immutable feature-set instance tied to a match and cutoff."""
+    prediction_cutoff = _require_aware(prediction_cutoff, "prediction_cutoff")
+    feature_version = _require_nonempty(feature_version, "feature_version")
+    feature_generation_version = _require_nonempty(
+        feature_generation_version, "feature_generation_version"
+    )
+    schema_version = _require_nonempty(schema_version, "schema_version")
+    source_data_reference = _require_mapping(source_data_reference, "source_data_reference")
+    feature_payload = _require_mapping(feature_payload, "feature_payload")
+    snapshot_id = source_data_reference.get("snapshot_id")
+    source_record_ids = source_data_reference.get("source_record_ids")
+    if not isinstance(snapshot_id, str) or not snapshot_id.strip():
+        raise ValueError("source_data_reference.snapshot_id must be a non-empty string")
+    if not isinstance(source_record_ids, list):
+        raise ValueError("source_data_reference.source_record_ids must be a list")
+
+    item = FeatureSet(
+        feature_set_id=feature_set_id,
+        match_id=match_id,
+        prediction_cutoff=prediction_cutoff,
+        feature_version=feature_version,
+        feature_generation_version=feature_generation_version,
+        source_data_reference=source_data_reference,
+        schema_version=schema_version,
+        feature_payload=feature_payload,
+    )
+    session.add(item)
+    session.flush()
+    return item
+
+
+def persist_model_version(
+    session: Session,
+    *,
+    model_id: UUID,
+    model_version: str,
+    model_type: str,
+    feature_version: str,
+    training_run_id: UUID,
+    training_data_reference: dict[str, Any],
+    artifact_reference: str,
+    configuration_reference: dict[str, Any] | None = None,
+    evaluation_status: str = "unevaluated",
+) -> ModelVersion:
+    """Persist one model version in the model family registry."""
+    model_version = _require_nonempty(model_version, "model_version")
+    model_type = _require_nonempty(model_type, "model_type")
+    feature_version = _require_nonempty(feature_version, "feature_version")
+    artifact_reference = _require_nonempty(artifact_reference, "artifact_reference")
+    training_data_reference = _require_mapping(training_data_reference, "training_data_reference")
+    if configuration_reference is not None:
+        configuration_reference = _require_mapping(
+            configuration_reference, "configuration_reference"
+        )
+    allowed_statuses = {"unevaluated", "passed", "failed", "retired"}
+    if evaluation_status not in allowed_statuses:
+        raise ValueError(
+            f"evaluation_status must be one of {sorted(allowed_statuses)}, got {evaluation_status!r}"
+        )
+
+    item = ModelVersion(
+        model_id=model_id,
+        model_version=model_version,
+        model_type=model_type,
+        feature_version=feature_version,
+        training_run_id=training_run_id,
+        training_data_reference=training_data_reference,
+        artifact_reference=artifact_reference,
+        configuration_reference=configuration_reference,
+        evaluation_status=evaluation_status,
+    )
+    session.add(item)
+    session.flush()
+    return item
+
+
+def persist_prediction(
+    session: Session,
+    *,
+    prediction_id: UUID,
+    match_id: UUID,
+    feature_set_id: UUID,
+    model_id: UUID,
+    model_version: str,
+    feature_version: str,
+    prediction_cutoff: datetime,
+    predicted_at: datetime,
+    prediction: str,
+    probabilities: dict[str, Any],
+    confidence: float | None,
+    status: str,
+) -> Prediction:
+    """Persist one prediction for a match using a specific feature-set and model revision."""
+    prediction_cutoff = _require_aware(prediction_cutoff, "prediction_cutoff")
+    predicted_at = _require_aware(predicted_at, "predicted_at")
+    model_version = _require_nonempty(model_version, "model_version")
+    feature_version = _require_nonempty(feature_version, "feature_version")
+    prediction_text = _require_nonempty(prediction, "prediction")
+    probabilities = _require_mapping(probabilities, "probabilities")
+    allowed_statuses = {"generated", "superseded", "invalid", "published"}
+    if status not in allowed_statuses:
+        raise ValueError(f"status must be one of {sorted(allowed_statuses)}, got {status!r}")
+    if confidence is not None:
+        try:
+            confidence_value = float(confidence)
+        except (TypeError, ValueError):
+            raise ValueError("confidence must be numeric or None") from None
+        if confidence_value < 0 or confidence_value > 1:
+            raise ValueError("confidence must be between 0 and 1")
+    else:
+        confidence_value = None
+
+    item = Prediction(
+        prediction_id=prediction_id,
+        match_id=match_id,
+        feature_set_id=feature_set_id,
+        model_id=model_id,
+        model_version=model_version,
+        feature_version=feature_version,
+        prediction_cutoff=prediction_cutoff,
+        predicted_at=predicted_at,
+        prediction=prediction_text,
+        probabilities=probabilities,
+        confidence=confidence_value,
+        status=status,
+    )
+    session.add(item)
+    session.flush()
+    return item
+
+
+def persist_prediction_batch(
+    session: Session,
+    *,
+    match_id: UUID,
+    feature_set_id: UUID,
+    feature_version: str,
+    feature_version_model: str | None = None,
+    feature_generation_version: str,
+    source_data_reference: dict[str, Any],
+    schema_version: str,
+    feature_payload: dict[str, Any],
+    model_id: UUID,
+    model_version: str,
+    model_type: str,
+    training_run_id: UUID,
+    training_data_reference: dict[str, Any],
+    artifact_reference: str,
+    configuration_reference: dict[str, Any] | None,
+    evaluation_status: str,
+    prediction_id: UUID,
+    prediction_cutoff: datetime,
+    predicted_at: datetime,
+    prediction: str,
+    probabilities: dict[str, Any],
+    confidence: float | None,
+    status: str,
+) -> tuple[FeatureSet, ModelVersion, Prediction]:
+    """Persist a single feature-set, model-version, and prediction atomically."""
+    match = session.get(Match, match_id)
+    if match is None:
+        raise ValueError(f"match_id {match_id} does not exist")
+
+    prediction_cutoff = _require_aware(prediction_cutoff, "prediction_cutoff")
+    feature_version = _require_nonempty(feature_version, "feature_version")
+
+    model_feature_version = (
+        _require_nonempty(feature_version_model, "feature_version_model")
+        if feature_version_model is not None
+        else feature_version
+    )
+    if feature_version != model_feature_version:
+        raise ValueError(
+            "feature_version mismatch between feature_set and model_version: "
+            f"{feature_version} != {model_feature_version}"
+        )
+
+    model_version_record = session.get(ModelVersion, (model_id, model_version))
+    if model_version_record is not None:
+        registered_metadata = {
+            "model_type": model_type,
+            "feature_version": model_feature_version,
+            "training_run_id": training_run_id,
+            "training_data_reference": training_data_reference,
+            "artifact_reference": artifact_reference,
+            "configuration_reference": configuration_reference,
+            "evaluation_status": evaluation_status,
+        }
+        for field_name, expected_value in registered_metadata.items():
+            if getattr(model_version_record, field_name) != expected_value:
+                raise ValueError(
+                    f"registered model version metadata mismatch for {field_name}"
+                )
+
+    source_data_reference = _require_mapping(source_data_reference, "source_data_reference")
+    source_record_ids = source_data_reference.get("source_record_ids")
+    if not isinstance(source_record_ids, list):
+        raise ValueError("source_data_reference.source_record_ids must be a list")
+    for source_record_id in source_record_ids:
+        if not isinstance(source_record_id, str):
+            raise ValueError("source_data_reference.source_record_ids must contain UUID strings")
+        try:
+            source_record_uuid = UUID(source_record_id)
+        except ValueError:
+            raise ValueError(
+                f"source_data_reference contains invalid source_record_id {source_record_id!r}"
+            ) from None
+        source_record = session.get(SourceRecord, source_record_uuid)
+        if source_record is None:
+            raise ValueError(f"source_record_id {source_record_id} does not exist")
+        if source_record.source_available_ts is None:
+            raise ValueError(f"source_record_id {source_record_id} has unknown availability")
+        available_at = _require_aware(
+            source_record.source_available_ts,
+            f"source_record_id {source_record_id} source_available_ts",
+        )
+        if available_at > prediction_cutoff:
+            raise ValueError(
+                f"source_record_id {source_record_id} was unavailable at prediction_cutoff"
+            )
+
+    feature_set = persist_feature_set(
+        session,
+        feature_set_id=feature_set_id,
+        match_id=match_id,
+        prediction_cutoff=prediction_cutoff,
+        feature_version=feature_version,
+        feature_generation_version=feature_generation_version,
+        source_data_reference=source_data_reference,
+        schema_version=schema_version,
+        feature_payload=feature_payload,
+    )
+    if model_version_record is None:
+        model_version_record = persist_model_version(
+            session,
+            model_id=model_id,
+            model_version=model_version,
+            model_type=model_type,
+            feature_version=model_feature_version,
+            training_run_id=training_run_id,
+            training_data_reference=training_data_reference,
+            artifact_reference=artifact_reference,
+            configuration_reference=configuration_reference,
+            evaluation_status=evaluation_status,
+        )
+
+    prediction_record = persist_prediction(
+        session,
+        prediction_id=prediction_id,
+        match_id=match_id,
+        feature_set_id=feature_set_id,
+        model_id=model_id,
+        model_version=model_version,
+        feature_version=feature_version,
+        prediction_cutoff=prediction_cutoff,
+        predicted_at=predicted_at,
+        prediction=prediction,
+        probabilities=probabilities,
+        confidence=confidence,
+        status=status,
+    )
+    session.flush()
+    return feature_set, model_version_record, prediction_record
 
 
 def persist_linked_records(

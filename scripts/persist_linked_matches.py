@@ -19,6 +19,19 @@ from src.db.ingestion import persist_linked_records
 from src.db.session import session_scope
 
 
+def load_linked_records(path: Path) -> list[dict]:
+    if not path.exists():
+        raise FileNotFoundError(f"linked-record file not found: {path}")
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        frame = pd.read_csv(path)
+    elif suffix in {".parquet", ".pq"}:
+        frame = pd.read_parquet(path)
+    else:
+        raise ValueError(f"unsupported linked-record file type: {path}")
+    return frame.to_dict(orient="records")
+
+
 def load_database_url() -> str:
     database_url = os.getenv("DATABASE_URL")
     if database_url:
@@ -62,7 +75,7 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    records = pd.read_parquet(args.input).to_dict(orient="records")
+    records = load_linked_records(args.input)
     event_times = load_verified_event_times(args.event_times)
     database_url = load_database_url()
     with session_scope(database_url) as session:
