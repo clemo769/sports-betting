@@ -18,6 +18,12 @@ from src.db.models import (
     SourceRecord,
 )
 from src.db.repositories import MatchRepository, SourceRecordRepository
+from src.features.temporal_contract import (
+    resolve_source_available_at,
+    validate_availability_basis,
+    validate_sha256_hash,
+)
+from src.source_evidence import persisted_snapshot_row_id
 
 
 def _require_aware(value: datetime, field_name: str) -> datetime:
@@ -537,14 +543,26 @@ def persist_linked_records(
     """
     rows = [dict(record) for record in records]
     batch_time = datetime.now(timezone.utc)
-    source_identities = [
-        (
-            str(row.get("source") or "").strip(),
-            str(row.get("source_id") or "").strip(),
-            _source_revision(row.get("source_revision", 1)),
+    source_identities = []
+    for row in rows:
+        source = str(row.get("source") or "").strip()
+        source_id = str(row.get("source_id") or "").strip()
+        source_snapshot_sha256 = validate_sha256_hash(
+            _optional_text(row.get("source_snapshot_sha256")),
+            "source_snapshot_sha256",
         )
-        for row in rows
-    ]
+        stored_source_id = persisted_snapshot_row_id(
+            _optional_text(row.get("raw_reference")),
+            source=source,
+            legacy_source_id=source_id,
+            snapshot_id=_optional_text(row.get("source_snapshot_id")),
+            snapshot_sha256=source_snapshot_sha256,
+        )
+        source_identities.append((
+            source,
+            stored_source_id,
+            _source_revision(row.get("source_revision", 1)),
+        ))
     if len(source_identities) != len(set(source_identities)):
         raise ValueError(
             "input contains duplicate source and source_id identities for the same source_revision"
@@ -627,18 +645,56 @@ def persist_linked_records(
             linked_match_id = UUID(str(row["canonical_match_id"]))
         event_at = _aware_source_timestamp(row.get("source_event_ts"))
         available_at = _aware_source_timestamp(row.get("source_available_ts"))
+        published_at = _aware_source_timestamp(row.get("source_published_ts"))
+        first_observed_at = _aware_source_timestamp(row.get("first_observed_at"))
+        snapshot_available_at = _aware_source_timestamp(row.get("snapshot_available_at"))
+        availability_basis = _optional_text(row.get("availability_basis"))
+        source_snapshot_id = _optional_text(row.get("source_snapshot_id"))
+        snapshot_sha256 = validate_sha256_hash(
+            _optional_text(row.get("source_snapshot_sha256")),
+            "source_snapshot_sha256",
+        )
+        if availability_basis is not None:
+            validate_availability_basis(availability_basis)
+            evidence_available_at = resolve_source_available_at(
+                availability_basis=availability_basis,
+                source_available_ts=available_at,
+                source_published_ts=published_at,
+                first_observed_at=first_observed_at,
+                snapshot_available_at=snapshot_available_at,
+                snapshot_id=source_snapshot_id,
+                snapshot_sha256=snapshot_sha256,
+                source_record_id=str(uuid5(NAMESPACE_URL, f"{source}:{source_id}:{revision}")),
+            )
+            if available_at is None:
+                available_at = evidence_available_at
+            elif evidence_available_at != available_at:
+                raise ValueError(
+                    f"source availability evidence conflicts with source_available_ts for {source}:{source_id}"
+                )
         if available_at is not None and available_at > batch_time:
             raise ValueError(f"source availability timestamp is in the future for {source}:{source_id}")
         source_fields = {
             "source_event_ts": event_at,
             "source_available_ts": available_at,
+            "source_published_ts": published_at,
+            "first_observed_at": first_observed_at,
+            "snapshot_available_at": snapshot_available_at,
+            "availability_basis": availability_basis,
             "source_available_ref": _optional_text(row.get("source_available_ref")),
             "raw_reference": _optional_text(row.get("raw_reference")),
             "original_filename": _optional_text(row.get("original_filename")),
             "parser_version": _optional_text(row.get("parser_version")),
         }
-        source_record_id = uuid5(NAMESPACE_URL, f"{source}:{source_id}:{revision}")
-        existing_record = source_repository.find_identity(source, source_id, revision)
+        stored_source_id = persisted_snapshot_row_id(
+            source_fields["raw_reference"],
+            source=source,
+            legacy_source_id=source_id,
+            snapshot_id=source_snapshot_id,
+            snapshot_sha256=snapshot_sha256,
+        )
+        source_record_id = uuid5(NAMESPACE_URL, f"{source}:{stored_source_id}:{revision}")
+        existing_record = source_repository.find_identity(source, stored_source_id, revision)
         if existing_record is not None:
             for field_name, expected_value in source_fields.items():
                 if getattr(existing_record, field_name) != expected_value:
@@ -664,11 +720,15 @@ def persist_linked_records(
                 SourceRecord(
                     source_record_id=source_record_id,
                     source=source,
-                    source_id=source_id,
+                    source_id=stored_source_id,
                     source_revision=revision,
                     match_id=linked_match_id,
                     source_event_ts=event_at,
                     source_available_ts=available_at,
+                    source_published_ts=published_at,
+                    first_observed_at=first_observed_at,
+                    snapshot_available_at=snapshot_available_at,
+                    availability_basis=availability_basis,
                     source_available_ref=source_fields["source_available_ref"],
                     ingest_ts=batch_time,
                     raw_reference=source_fields["raw_reference"],
@@ -698,7 +758,7 @@ def persist_linked_records(
                 )
             observation_id = uuid5(
                 NAMESPACE_URL,
-                f"result:{source}:{source_id}:{revision}:{home_goals}:{away_goals}",
+                f"result:{source}:{stored_source_id}:{revision}:{home_goals}:{away_goals}",
             )
             if session.get(ResultObservation, observation_id) is None:
                 session.add(

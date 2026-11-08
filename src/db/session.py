@@ -18,6 +18,14 @@ def create_session_factory(database_url: str | None = None) -> sessionmaker[Sess
     return sessionmaker(bind=engine, expire_on_commit=False)
 
 
+def create_test_session_factory() -> sessionmaker[Session]:
+    """Create a session factory from TEST_DATABASE_URL without changing app defaults."""
+    database_url = os.getenv("TEST_DATABASE_URL")
+    if not database_url:
+        raise RuntimeError("TEST_DATABASE_URL must be set before opening a test database session")
+    return create_session_factory(database_url)
+
+
 @contextmanager
 def session_scope(database_url: str | None = None) -> Iterator[Session]:
     """Provide one transaction-scoped session, committing or rolling back atomically."""

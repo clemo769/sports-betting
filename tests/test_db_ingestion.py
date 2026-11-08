@@ -1,4 +1,5 @@
 from datetime import datetime, timezone
+import json
 from uuid import NAMESPACE_URL, uuid4, uuid5
 
 import pytest
@@ -272,6 +273,208 @@ def test_ingestion_persists_verified_match_and_source_provenance():
         for observation in observations
     )
     assert session.flushed
+
+
+def test_ingestion_persists_snapshot_availability_evidence_without_changing_identity():
+    canonical_id = uuid4()
+    records = linked_pair(canonical_id)
+    snapshot_time = datetime(2024, 5, 13, 0, 0, tzinfo=timezone.utc)
+    for row in records:
+        row.update({
+            "source_available_ts": snapshot_time.isoformat(),
+            "source_published_ts": None,
+            "first_observed_at": None,
+            "snapshot_available_at": snapshot_time.isoformat(),
+            "availability_basis": "snapshot",
+            "source_available_ref": "commit-sha-exact",
+            "source_snapshot_id": "github:openfootball/football.json:season/en.1.json@commit-sha-exact",
+            "source_snapshot_sha256": "a" * 64,
+            "raw_reference": (
+                '{"source_snapshot_id":"github:openfootball/football.json:'
+                'season/en.1.json@commit-sha-exact","source_event_date_raw":"2024-05-12"}'
+            ),
+        })
+    session = FakeSession()
+
+    persist_linked_records(
+        session,
+        records,
+        {str(canonical_id): datetime(2024, 5, 12, 15, 0, tzinfo=timezone.utc)},
+    )
+
+    source_records = [item for item in session.added if isinstance(item, SourceRecord)]
+    assert len(source_records) == 2
+    assert [record.source_revision for record in source_records] == [1, 1]
+    assert {record.source_id for record in source_records} == {"fdco:1", "openfootball:1"}
+    assert all(record.availability_basis == "snapshot" for record in source_records)
+    assert all(record.source_published_ts is None for record in source_records)
+    assert all(record.first_observed_at is None for record in source_records)
+    assert all(record.snapshot_available_at == snapshot_time for record in source_records)
+    assert all(record.source_available_ts == snapshot_time for record in source_records)
+    assert all(record.source_available_ref == "commit-sha-exact" for record in source_records)
+    assert all("source_snapshot_id" in record.raw_reference for record in source_records)
+
+
+def test_snapshot_row_evidence_persists_idempotently_without_changing_public_source_id(monkeypatch):
+    canonical_id = uuid4()
+    records = linked_pair(canonical_id)
+    from src.db.repositories import SourceRecordRepository
+    from src.source_evidence import build_source_row_evidence, canonical_content_sha256
+
+    for index, record in enumerate(records):
+        raw_content = {"home": "Arsenal", "away": "Chelsea"}
+        source = record["source"]
+        snapshot_id = f"snapshot-{source}"
+        snapshot_sha256 = f"{index + 1:x}" * 64
+        evidence = build_source_row_evidence(
+            source=source,
+            legacy_source_id=record["source_id"],
+            snapshot_id=snapshot_id,
+            snapshot_sha256=snapshot_sha256,
+            source_repository=None,
+            source_file_path=None,
+            filename=f"{source}.csv",
+            row_locator={"type": "csv_data_record_index", "value": index},
+            raw_row_content=raw_content,
+            availability={"status": "unknown", "basis": None, "available_at": None},
+            logical_identity_unavailable_reason="provider identifier not supplied",
+        )
+        record["source_snapshot_id"] = snapshot_id
+        record["source_snapshot_sha256"] = snapshot_sha256
+        record["raw_reference"] = json.dumps({"source_row_evidence": evidence}, sort_keys=True)
+        assert evidence["row"]["content_sha256"] == canonical_content_sha256(raw_content)
+
+    session = FakeSession()
+    monkeypatch.setattr(
+        "src.db.ingestion.SourceRecordRepository.find_identity",
+        lambda repository, source, source_id, revision: next(
+            (
+                item
+                for item in session.added
+                if isinstance(item, SourceRecord)
+                and item.source == source
+                and item._source_id == source_id
+                and item.source_revision == revision
+            ),
+            None,
+        ),
+    )
+    event_times = {str(canonical_id): datetime(2024, 5, 12, 15, 0, tzinfo=timezone.utc)}
+    persist_linked_records(session, records, event_times)
+    source_records = [item for item in session.added if isinstance(item, SourceRecord)]
+    first_storage_ids = [record._source_id for record in source_records]
+    assert [record.source_id for record in source_records] == ["fdco:1", "openfootball:1"]
+    assert all(record._source_id != record.source_id for record in source_records)
+    retrieved = SourceRecordRepository(session).get(source_records[0].source_record_id)
+    assert retrieved is source_records[0]
+    assert json.loads(retrieved.raw_reference)["source_row_evidence"]["snapshot"]["snapshot_id"] == (
+        records[0]["source_snapshot_id"]
+    )
+
+    persist_linked_records(session, records, event_times)
+
+    assert [item for item in session.added if isinstance(item, SourceRecord)] == source_records
+    assert [record._source_id for record in source_records] == first_storage_ids
+    assert all(json.loads(record.raw_reference)["source_row_evidence"]["schema_version"] == "source-row-evidence-v1" for record in source_records)
+
+    changed = dict(records[0])
+    changed_reference = json.loads(changed["raw_reference"])
+    changed_reference["source_row_evidence"]["adapter_enrichment"] = {"changed": True}
+    changed["raw_reference"] = json.dumps(changed_reference, sort_keys=True)
+    with pytest.raises(ValueError, match="is immutable"):
+        persist_linked_records(session, [changed, records[1]], event_times)
+
+
+def test_distinct_snapshot_evidence_uses_distinct_storage_identity():
+    canonical_id = uuid4()
+    records = linked_pair(canonical_id)
+    from src.source_evidence import build_source_row_evidence
+
+    for index, record in enumerate(records):
+        snapshot_id = f"snapshot-{index}"
+        snapshot_sha256 = f"{index + 1:x}" * 64
+        evidence = build_source_row_evidence(
+            source=record["source"],
+            legacy_source_id=record["source_id"],
+            snapshot_id=snapshot_id,
+            snapshot_sha256=snapshot_sha256,
+            source_repository=None,
+            source_file_path=None,
+            filename=f"{record['source']}.csv",
+            row_locator={"type": "record", "value": 0},
+            raw_row_content={"home": "Arsenal", "away": "Chelsea", "score": 2},
+            availability={"status": "unknown", "basis": None, "available_at": None},
+            logical_identity_unavailable_reason="provider identifier not supplied",
+        )
+        record["source_snapshot_id"] = snapshot_id
+        record["source_snapshot_sha256"] = snapshot_sha256
+        record["raw_reference"] = json.dumps({"source_row_evidence": evidence}, sort_keys=True)
+
+    session = FakeSession()
+    persist_linked_records(
+        session,
+        records,
+        {str(canonical_id): datetime(2024, 5, 12, 15, 0, tzinfo=timezone.utc)},
+    )
+
+    source_records = [item for item in session.added if isinstance(item, SourceRecord)]
+    assert len(source_records) == 2
+    assert len({record._source_id for record in source_records}) == 2
+
+
+def test_same_legacy_row_ids_in_new_snapshots_persist_as_distinct_evidence():
+    canonical_id = uuid4()
+    first_snapshot = linked_pair(canonical_id)
+    second_snapshot = linked_pair(canonical_id)
+    from src.source_evidence import build_source_row_evidence
+
+    for snapshot_number, records in enumerate((first_snapshot, second_snapshot), start=1):
+        for index, record in enumerate(records):
+            snapshot_id = f"snapshot-{snapshot_number}-{record['source']}"
+            snapshot_sha256 = f"{snapshot_number:x}" * 63 + f"{index + 1:x}"
+            evidence = build_source_row_evidence(
+                source=record["source"],
+                legacy_source_id=record["source_id"],
+                snapshot_id=snapshot_id,
+                snapshot_sha256=snapshot_sha256,
+                source_repository=None,
+                source_file_path=None,
+                filename=f"{record['source']}.csv",
+                row_locator={"type": "record", "value": 0},
+                raw_row_content={"home": "Arsenal", "away": "Chelsea", "score": 2},
+                availability={"status": "unknown", "basis": None, "available_at": None},
+                logical_identity_unavailable_reason="provider identifier not supplied",
+            )
+            record["source_snapshot_id"] = snapshot_id
+            record["source_snapshot_sha256"] = snapshot_sha256
+            record["raw_reference"] = json.dumps({"source_row_evidence": evidence}, sort_keys=True)
+
+    session = FakeSession()
+    persist_linked_records(
+        session,
+        [*first_snapshot, *second_snapshot],
+        {str(canonical_id): datetime(2024, 5, 12, 15, 0, tzinfo=timezone.utc)},
+    )
+
+    source_records = [item for item in session.added if isinstance(item, SourceRecord)]
+    observations = [item for item in session.added if isinstance(item, ResultObservation)]
+    assert len(source_records) == 4
+    assert len({record._source_id for record in source_records}) == 4
+    assert len(observations) == 4
+
+
+def test_legacy_source_record_identity_remains_readable():
+    record = SourceRecord(
+        source_record_id=uuid4(),
+        source="fdco",
+        source_id="legacy-file.csv:7",
+        source_revision=1,
+        ingest_ts=datetime(2024, 5, 14, tzinfo=timezone.utc),
+        raw_reference=None,
+    )
+
+    assert record.source_id == "legacy-file.csv:7"
+    assert record._source_id == "legacy-file.csv:7"
 
 
 def test_result_observation_resolution_appends_without_mutating_prior_record():

@@ -56,7 +56,7 @@ class MatchRepository:
             self.session.scalars(
                 select(SourceRecord)
                 .where(SourceRecord.match_id == match_id)
-                .order_by(SourceRecord.source, SourceRecord.source_id)
+                .order_by(SourceRecord.source, SourceRecord._source_id)
             )
         )
         match.result_observations = list(
@@ -82,11 +82,11 @@ class SourceRecordRepository:
         return record
 
     def find_identity(
-        self, source: str, source_id: str, source_revision: int = 1
+        self, source: str, stored_source_id: str, source_revision: int = 1
     ) -> SourceRecord | None:
         statement = select(SourceRecord).where(
             SourceRecord.source == source,
-            SourceRecord.source_id == source_id,
+            SourceRecord._source_id == stored_source_id,
             SourceRecord.source_revision == source_revision,
         )
         return self.session.scalar(statement)

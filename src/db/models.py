@@ -5,6 +5,7 @@ from uuid import UUID
 
 from sqlalchemy import (
     CheckConstraint,
+    CHAR,
     DateTime,
     ForeignKey,
     ForeignKeyConstraint,
@@ -19,6 +20,12 @@ from sqlalchemy.dialects.postgresql import JSONB, UUID as PostgreSQLUUID
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from src.db.base import Base
+from src.source_evidence import legacy_source_id_from_reference
+from src.temporal import AVAILABILITY_BASIS_VALUES, PREDICTION_MODE_VALUES
+
+
+_PREDICTION_MODE_SQL_VALUES = ", ".join(repr(value) for value in PREDICTION_MODE_VALUES)
+_AVAILABILITY_BASIS_SQL_VALUES = ", ".join(repr(value) for value in AVAILABILITY_BASIS_VALUES)
 
 
 class Match(Base):
@@ -30,6 +37,10 @@ class Match(Base):
         CheckConstraint("btrim(home_team) <> ''", name="ck_match_home_team_nonempty"),
         CheckConstraint("btrim(away_team) <> ''", name="ck_match_away_team_nonempty"),
         CheckConstraint("home_team <> away_team", name="ck_match_distinct_teams"),
+        CheckConstraint(
+            "actual_start_at IS NULL OR completed_at IS NULL OR actual_start_at <= completed_at",
+            name="ck_match_actual_start_before_completion",
+        ),
         CheckConstraint(
             "status IN ('scheduled', 'completed', 'cancelled')",
             name="ck_match_status",
@@ -49,6 +60,8 @@ class Match(Base):
     home_team: Mapped[str] = mapped_column(Text, nullable=False)
     away_team: Mapped[str] = mapped_column(Text, nullable=False)
     event_time: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    actual_start_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     status: Mapped[str] = mapped_column(Text, nullable=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
@@ -78,6 +91,37 @@ class SourceRecord(Base):
             name="ck_source_record_available_before_ingest",
         ),
         CheckConstraint(
+            "first_observed_at IS NULL OR first_observed_at <= ingest_ts",
+            name="ck_source_record_first_observed_before_ingest",
+        ),
+        CheckConstraint(
+            "availability_basis IS NULL OR "
+            f"availability_basis IN ({_AVAILABILITY_BASIS_SQL_VALUES})",
+            name="ck_source_record_availability_basis",
+        ),
+        CheckConstraint(
+            "availability_basis IS DISTINCT FROM 'provider_publication' "
+            "OR source_available_ts IS NULL",
+            name="ck_source_record_publication_not_accessibility",
+        ),
+        CheckConstraint(
+            "availability_basis IS DISTINCT FROM 'first_observed' OR "
+            "(first_observed_at IS NOT NULL AND source_available_ts IS NOT NULL "
+            "AND first_observed_at = source_available_ts)",
+            name="ck_source_record_first_observed_basis_consistent",
+        ),
+        CheckConstraint(
+            "availability_basis IS DISTINCT FROM 'snapshot' OR "
+            "(snapshot_available_at IS NOT NULL AND source_available_ts IS NOT NULL "
+            "AND snapshot_available_at = source_available_ts)",
+            name="ck_source_record_snapshot_basis_consistent",
+        ),
+        CheckConstraint(
+            "availability_basis IS DISTINCT FROM 'verified_access' "
+            "OR source_available_ts IS NOT NULL",
+            name="ck_source_record_verified_access_basis_consistent",
+        ),
+        CheckConstraint(
             "original_filename IS NULL OR btrim(original_filename) <> ''",
             name="ck_source_record_filename_nonempty",
         ),
@@ -97,13 +141,17 @@ class SourceRecord(Base):
 
     source_record_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), primary_key=True)
     source: Mapped[str] = mapped_column(Text, nullable=False)
-    source_id: Mapped[str] = mapped_column(Text, nullable=False)
+    _source_id: Mapped[str] = mapped_column("source_id", Text, nullable=False)
     source_revision: Mapped[int] = mapped_column(nullable=False, server_default="1")
     match_id: Mapped[UUID | None] = mapped_column(
         PostgreSQLUUID(as_uuid=True), ForeignKey("match.match_id", name="fk_source_record_match_id_match")
     )
     source_event_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     source_available_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    source_published_ts: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    first_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    snapshot_available_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    availability_basis: Mapped[str | None] = mapped_column(Text)
     source_available_ref: Mapped[str | None] = mapped_column(Text)
     ingest_ts: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     raw_reference: Mapped[str | None] = mapped_column(Text)
@@ -117,6 +165,14 @@ class SourceRecord(Base):
     result_observations: Mapped[list["ResultObservation"]] = relationship(
         back_populates="source_record", foreign_keys="ResultObservation.source_record_id"
     )
+
+    @property
+    def source_id(self) -> str:
+        return legacy_source_id_from_reference(self.raw_reference) or self._source_id
+
+    @source_id.setter
+    def source_id(self, value: str) -> None:
+        self._source_id = value
 
 
 class FeatureSet(Base):
@@ -148,6 +204,23 @@ class FeatureSet(Base):
             "jsonb_typeof(feature_payload) = 'object'",
             name="ck_feature_set_payload_object",
         ),
+        CheckConstraint(
+            "prediction_mode IS NULL OR "
+            f"prediction_mode IN ({_PREDICTION_MODE_SQL_VALUES})",
+            name="ck_feature_set_prediction_mode",
+        ),
+        CheckConstraint(
+            "prediction_mode IS DISTINCT FROM 'STRICT_PRE_MATCH' OR "
+            "(scheduled_event_time_at_cutoff IS NOT NULL "
+            "AND prediction_cutoff < scheduled_event_time_at_cutoff)",
+            name="ck_feature_set_strict_cutoff_before_event",
+        ),
+        CheckConstraint(
+            "artifact_content_hash IS NULL OR "
+            "(char_length(btrim(artifact_content_hash)) = 64 "
+            "AND btrim(artifact_content_hash) ~ '^[0-9a-f]{64}$')",
+            name="ck_feature_set_artifact_sha256",
+        ),
         Index(
             "ix_feature_set_match_cutoff",
             "match_id",
@@ -169,6 +242,9 @@ class FeatureSet(Base):
     source_data_reference: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     schema_version: Mapped[str] = mapped_column(Text, nullable=False)
     feature_payload: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
+    prediction_mode: Mapped[str | None] = mapped_column(Text)
+    scheduled_event_time_at_cutoff: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    artifact_content_hash: Mapped[str | None] = mapped_column(CHAR(64))
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
     )
@@ -193,6 +269,16 @@ class ModelVersion(Base):
             name="ck_model_configuration_reference_object",
         ),
         CheckConstraint(
+            "feature_schema_version IS NULL OR btrim(feature_schema_version) <> ''",
+            name="ck_model_feature_schema_version_nonempty",
+        ),
+        CheckConstraint(
+            "artifact_content_hash IS NULL OR "
+            "(char_length(btrim(artifact_content_hash)) = 64 "
+            "AND btrim(artifact_content_hash) ~ '^[0-9a-f]{64}$')",
+            name="ck_model_artifact_sha256",
+        ),
+        CheckConstraint(
             "evaluation_status IN ('unevaluated', 'passed', 'failed', 'retired')",
             name="ck_model_evaluation_status",
         ),
@@ -208,6 +294,8 @@ class ModelVersion(Base):
     training_run_id: Mapped[UUID] = mapped_column(PostgreSQLUUID(as_uuid=True), nullable=False)
     training_data_reference: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     artifact_reference: Mapped[str] = mapped_column(Text, nullable=False)
+    feature_schema_version: Mapped[str | None] = mapped_column(Text)
+    artifact_content_hash: Mapped[str | None] = mapped_column(CHAR(64))
     configuration_reference: Mapped[dict[str, Any] | None] = mapped_column(JSONB)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=text("CURRENT_TIMESTAMP")
@@ -238,6 +326,11 @@ class Prediction(Base):
         CheckConstraint(
             "status IN ('generated', 'superseded', 'invalid', 'published')",
             name="ck_prediction_status",
+        ),
+        CheckConstraint(
+            "prediction_mode IS NULL OR "
+            f"prediction_mode IN ({_PREDICTION_MODE_SQL_VALUES})",
+            name="ck_prediction_prediction_mode",
         ),
         Index(
             "ix_prediction_match_predicted_at",
@@ -274,6 +367,7 @@ class Prediction(Base):
     probabilities: Mapped[dict[str, Any]] = mapped_column(JSONB, nullable=False)
     confidence: Mapped[Decimal | None] = mapped_column(Numeric)
     status: Mapped[str] = mapped_column(Text, nullable=False)
+    prediction_mode: Mapped[str | None] = mapped_column(Text)
 
     match: Mapped[Match] = relationship(back_populates="predictions")
     feature_set: Mapped[FeatureSet] = relationship(back_populates="predictions")
@@ -287,6 +381,14 @@ class ResultObservation(Base):
             ["source_record_id", "match_id"],
             ["source_record.source_record_id", "source_record.match_id"],
             name="fk_result_observation_source_record_same_match",
+        ),
+        UniqueConstraint(
+            "result_observation_id", "match_id", name="uq_result_observation_id_match"
+        ),
+        ForeignKeyConstraint(
+            ["supersedes_observation_id", "match_id"],
+            ["result_observation.result_observation_id", "result_observation.match_id"],
+            name="fk_result_observation_supersedes_same_match",
         ),
         CheckConstraint(
             "supersedes_observation_id IS NULL OR "
@@ -358,8 +460,11 @@ class ResultObservation(Base):
         back_populates="result_observations", foreign_keys=[source_record_id]
     )
     supersedes_observation: Mapped["ResultObservation | None"] = relationship(
-        remote_side=[result_observation_id], back_populates="superseding_observations"
+        remote_side=[result_observation_id],
+        foreign_keys=[supersedes_observation_id],
+        back_populates="superseding_observations",
     )
     superseding_observations: Mapped[list["ResultObservation"]] = relationship(
-        back_populates="supersedes_observation"
+        foreign_keys=[supersedes_observation_id],
+        back_populates="supersedes_observation",
     )

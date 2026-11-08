@@ -21,8 +21,15 @@ def test_openfootball_snapshot_timestamp_is_preserved(monkeypatch):
 
     monkeypatch.setattr("scripts.fetch_openfootball.requests.get", lambda *args, **kwargs: Response())
     assert source_snapshot_metadata("2023-24", "premier-league") == {
-        "source_available_ts": "2025-03-27T19:52:42Z",
+        "source_available_ts": "2025-03-27T19:52:42+00:00",
         "source_available_ref": "abc123",
+        "source_published_ts": None,
+        "snapshot_available_at": "2025-03-27T19:52:42+00:00",
+        "availability_basis": "snapshot",
+        "source_repository": "openfootball/football.json",
+        "source_file_path": "2023-24/en.1.json",
+        "source_snapshot_id": "github:openfootball/football.json:2023-24/en.1.json@abc123",
+        "source_commit_sha": "abc123",
     }
 
 
